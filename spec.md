@@ -2,6 +2,7 @@ Lease Matrix v0.1 — Comprehensive Implementation Specification
 Status: Ready for autonomous implementation
 Target implementer: OpenCode GLM-5.3 build agent
 Revision date: 2026-08-24
+Amended: 2026-08-24 — architect review resolutions applied (asymmetric trade-equity rule, firstPaymentCents, contractual-cents solver variance, §12.3 registry additions, E-2/E-3/E-6 refinements). Resolutions recorded in SPEC_ERRATA.md Part 3.
 Supersedes: The 2026-08-23 Next.js-oriented implementation spec
 Repository name: lease-matrix
 Preferred GitHub owner: stars-end when the authenticated account can create repositories there; otherwise the authenticated personal account
@@ -583,6 +584,15 @@ Do not add a second state-management, validation, form, routing, or test framewo
 
 5.5 Framework decision
 Vite is mandatory for v0.1 because the product is a client-side spreadsheet application with local persistence, no SSR requirement, no SEO-dependent pages, no authentication, and no backend. The framework-neutral packages and host protocol provide the future integration seam; a Node rendering framework would not improve that seam.
+
+5.6 Zod and exactOptionalPropertyTypes pattern
+Schema-first at I/O boundaries: for transfer documents, persistence envelopes, CSV rows, and adapter proposals, the Zod schema is the source of truth. Derive wire types with `z.input`/`z.output`; never duplicate a schema-owned wire type as a handwritten interface.
+
+Handwritten domain types keep `field?: T` (not `field?: T | undefined`). Absent domain values are represented by omission; domain builders use conditional spreads and never write explicit `undefined`.
+
+Normalize boundary output once through a shared `compactUndefinedDeep(value)` utility, applied immediately after successful boundary parsing and before domain command construction, persistence, JSON export, or host-protocol serialization. It removes undefined-valued object properties, rejects `undefined` array elements rather than silently converting them to `null`, preserves `null` only where the schema explicitly permits it, preserves branded integer values, and has unit tests covering nested objects and arrays.
+
+Keep `exactOptionalPropertyTypes: true`. Do not add per-file casts, `as unknown as`, or optional-field workarounds. Record this decision once in docs/decisions.md.
 
 6. Repository layout and boundaries
 Create this structure:
@@ -1309,7 +1319,7 @@ export interface LeaseDeal {
   feeLines: FeeLine[];
   taxProfile: TaxProfile;
   cashDownCents: MoneyCents;
-  tradeEquityCents: MoneyCents;
+  tradeEquityCents: MoneyCents;    // signed net equity: positive = positive equity applied to the lease; negative = equity capitalized into the lease
   dispositionFeeCents: MoneyCents;
   notes?: string;
   tags: string[];
@@ -1339,6 +1349,7 @@ export interface LeaseCalculationResult {
   pretaxMonthlyCents?: MoneyCents;
   taxMonthlyCents?: MoneyCents;
   postTaxMonthlyCents?: MoneyCents;
+  firstPaymentCents?: MoneyCents;  // tax-profile output: first scheduled installment due at signing; equals postTaxMonthlyCents only under the California monthly-payment profile
   dueAtSigningExcludingMsdCents?: MoneyCents;
   msdCents?: MoneyCents;
   dueAtSigningIncludingMsdCents?: MoneyCents;
@@ -1372,7 +1383,7 @@ export interface WorkspaceSettings {
   showArchived: boolean;
   compactDensity: boolean;
   includeDispositionFeeInEffectiveCost: boolean;
-  includeTradeEquityInCashDAS: boolean;
+  includePositiveTradeEquityInDisplayedDAS: boolean;
 }
 Keep settings financial and presentation-specific. Do not add user-account, cloud-sync, analytics, or partner credentials to the workspace document.
 
@@ -1552,14 +1563,16 @@ All functions are pure and deterministic.
 
 export interface CalculationPolicy {
   includeDispositionFeeInEffectiveCost: boolean;
-  includeTradeEquityInCashDAS: boolean;
+  includePositiveTradeEquityInDisplayedDAS: boolean;
 }
 
 export const DEFAULT_CALCULATION_POLICY: CalculationPolicy = {
   includeDispositionFeeInEffectiveCost: true,
-  includeTradeEquityInCashDAS: false,
+  includePositiveTradeEquityInDisplayedDAS: false,
 };
 The web composition root derives the policy from WorkspaceSettings; solvers and direct calculations must use the same policy.
+
+The renamed equity flag is display-only: it must not change adjusted cap cost, payment, or effective cost. When true, the alternate signing-contribution DAS view adds positive trade equity only. Capitalized negative equity remains reflected through the contractual payments.
 
 Normative supporting result shapes:
 
@@ -1667,8 +1680,11 @@ adjusted cap cost =
   − taxed customer cap reductions
   − untaxed customer cap reductions
   − cash down
-  − trade equity applied
+  − positive trade equity
+  + capitalized negative equity
   − applicable DAS credits that are explicitly capitalized
+
+Trade equity is signed net equity. Derive positiveTradeEquityCents = max(tradeEquityCents, 0) and capitalizedNegativeEquityCents = max(−tradeEquityCents, 0).
 
 depreciation charge = (adjusted cap cost − residual value) / term
 
@@ -1688,7 +1704,9 @@ Round residual value to cents after all residual adjustments.
 
 Solvers target a payment residual of no more than one cent.
 
-Selling-price solver result is rounded to the nearest dollar for the default grid and retained to cents internally.
+Selling-price solver results are cent-precise integers. The default grid may display impliedSellingPriceCents rounded to the nearest dollar; golden fixtures assert the cent-precise value, and a separate presentation test may assert the nearest-dollar display.
+
+Solver variance reporting: keep full Decimal precision to guide interval selection and bisection, then compute achievedMonthlyCents as the contractually rounded monthly payment and paymentVarianceCents = achievedMonthlyCents − quotedMonthlyCents. Stop when the absolute integer-cent variance is within paymentToleranceCents. Never report a fractional-cent residual under a MoneyCents field name; a raw Decimal payment residual may exist as a debug-only value but is not the canonical paymentVarianceCents and must not affect fixture portability.
 
 11.4 Tax behavior in validated California profile
 For the v0.1 California monthly-payment profile:
@@ -1707,11 +1725,13 @@ compare the implementation against committed fixtures and document any known mis
 
 Other imported tax modes may be stored, displayed, and exported, but must carry an experimental warning until validated.
 
+California taxability is line-specific: do not treat every incentive or fee as taxable merely because it appears in a category. The profile and the normalized line records determine tax treatment. The tax calculation exposes an explicit firstPaymentCents output; for this profile firstPaymentCents = postTaxMonthlyCents.
+
 11.5 Due at signing
 Define:
 
 DAS excluding MSD =
-  first contractual monthly payment
+  firstPaymentCents (tax-profile output; not universally the post-tax monthly)
   + upfront fees
   + upfront taxes
   + cash down
@@ -1720,11 +1740,13 @@ DAS excluding MSD =
 DAS including MSD = DAS excluding MSD + refundable MSD amount
 Do not include refundable MSDs in non-refundable effective lease cost.
 
+First contractual payment means the first scheduled periodic installment due at signing after the selected tax profile has applied its upfront-versus-capitalized tax treatment. Separate upfront tax is not part of the periodic installment. In an upfront-total-tax treatment the first installment may be the base periodic payment with tax as a separate upfront line; if upfront tax is capitalized, the scheduled installment contains financing attributable to that capitalized tax. In Texas-style treatment the tax is imposed on the lessor's purchase and subsequent installments are not themselves taxed. No solver or DAS formula may choose between pretax and post-tax payment by inspecting the tax-method name directly.
+
 11.6 Total and effective cost
 total non-refundable economic cost =
   contractual monthly payment × term
   + cash down
-  + trade equity applied
+  + positive trade equity surrendered
   + upfront non-refundable fees and taxes not already included in monthly
   + disposition fee when `CalculationPolicy.includeDispositionFeeInEffectiveCost` is true
   − due-at-signing credits not already reflected in monthly
@@ -1733,7 +1755,7 @@ total non-refundable economic cost =
 effective monthly = total non-refundable economic cost / term
 
 effective monthly / MSRP = effective monthly ÷ MSRP
-The ordinary dealer-facing "DAS" display is out-of-pocket cash and excludes trade equity unless the user explicitly chooses an economic-contribution view. Effective cost must include trade equity because it is value surrendered by the customer.
+The ordinary dealer-facing "DAS" display is out-of-pocket cash and excludes trade equity unless the user explicitly chooses an economic-contribution view; that alternate view (`CalculationPolicy.includePositiveTradeEquityInDisplayedDAS`) adds positive trade equity only. Total economic cost adds positive trade equity surrendered because it is customer value given up. Do not add or subtract capitalized negative equity again here — its cost is already reflected in the contractual payments. Negative equity paid separately at signing is not representable by the signed field in v0.1; it requires a separate upfront non-refundable line or an unsupported-state warning.
 
 Display the payment/MSRP ratio in basis points and percentage form.
 
@@ -1781,7 +1803,7 @@ If due-at-signing credits exceed otherwise due cash, do not create negative driv
 
 If the target remains impossible, return an error explaining the minimum achievable DAS and which items cannot legally or operationally be capitalized under the current profile.
 
-Never silently treat MSD or trade equity as non-refundable cash down. Trade equity is an economic contribution but is included in cash-out-of-pocket DAS only when CalculationPolicy.includeTradeEquityInCashDAS is true.
+Never silently treat MSD or trade equity as non-refundable cash down. Trade equity is an economic contribution but is included in cash-out-of-pocket DAS only when CalculationPolicy.includePositiveTradeEquityInDisplayedDAS is true, and only its positive part.
 
 11.9 Implied-selling-price solver
 For quoted-payment mode:
@@ -1854,7 +1876,7 @@ Selling price	sales_price	supported input
 Term	months	supported input
 MF	mf	supported input
 MSD count	msd	supported input
-Cash down/cap reduction	dp	supported input
+Cash down/cap reduction	dp	supported input; positive values map to cash cap reduction. Public links contain negative dp values used as balancing adjustments: a negative value produces an import warning and remains an unresolved source diagnostic unless an explicit canonical meaning is selected
 Dealer fee	dealer_fee	supported input
 Acquisition fee	acq_fee	supported input
 Disposition fee	disp_fee	supported input
@@ -1866,11 +1888,17 @@ Post-sale rebate	rebate	supported input
 Residual percent	resP	supported input
 Sales-tax rate	sales_tax	supported input
 Demo mileage	demo_mileage	supported input
-Trade equity	tradein	supported input
+Trade equity	tradein	source diagnostic/preserve-only until a nonzero fixture confirms whether it represents net equity, gross trade value, or another quantity
 Zero-drive-off selection	zero_driveoff	supported source flag; reconcile through DAS preview
 Monthly-payment tax mode	monthlyTax_radio	supported source flag
 Total-lease-payment tax mode	totalLeaseTax_radio	supported source flag; experimental tax profile
 Capitalized tax flag	cap_tax	supported source flag when validated by fixture
+Selling-price tax mode	sellingPriceTax_radio	experimental source tax-method flag
+Legacy selling-price tax alias	salesPriceTax_radio	import-only legacy alias of sellingPriceTax_radio
+Fees-untaxed flag	fees_untaxed	experimental source flag
+New York tax flag	ny_tax	preserve-only until a manual fixture covers its interaction with total-tax mode
+LVF result-view flag	lvf_result_mode	preserve-only UI-state alias observed in public URLs
+Doc fee (legacy alias)	doc_fee	import-only legacy dealer-fee alias; map to dealer_fee only after a manual fixture confirms semantics
 Acquisition/dealer/government fee check flags	acqFee_check, dealerFee_check, govFee_check	preserve and map only when fixture semantics are verified
 Private memo	memo	importable private optional field; omitted from fresh export by default
 Source-reported pre-tax payment	pretax_monPmt	diagnostic only; never authoritative input automatically
@@ -1918,6 +1946,12 @@ Do not overwrite the active row until the user reviews an import preview.
 If imported values conflict with an active preset, show both and require a choice.
 
 Preserve unknown parameters in the proposal and accepted source provenance; do not silently discard them.
+
+Values outside domain bounds produce preview validation issues; they are never clamped or coerced into valid domain values. No parameter name implies valid content.
+
+Source-reported pretax_monPmt and lease_das may be recalculated by the calculator when a link is reopened; they remain diagnostics and never authoritative inputs.
+
+M3 completion additionally requires the manual validation procedure and vectors recorded in SPEC_ERRATA.md Part 3: local parse of each vector without any network request, import-preview comparison against expected fields, confirmation that diagnostics stay diagnostic, fresh export from the accepted canonical document, manual browser reopen, and semantic round-trip comparison of supported financial inputs (not byte-for-byte URL equality — redirects between leasehackr.com/calculator and calculator.leasehackr.com, parameter reordering, and recalculated output fields do not fail semantic round-trip).
 
 12.5 Export
 Generate a standards-compliant URL with URL and URLSearchParams.
@@ -2790,7 +2824,15 @@ Before CSV export, show which identifying columns are included. Default to deale
 
 CSV security:
 
-Prefix free-text cells beginning with =, +, -, or @ so spreadsheet applications do not execute formulas.
+Determine escape behavior from the declared CSV column type, never from a permissive generic number parser.
+
+Numeric columns serialize through the canonical numeric serializer: valid negative values such as -1500 remain unescaped; noncanonical or mixed numeric/formula strings are rejected; currency symbols and thousands separators are never exported in machine numeric fields.
+
+Free-text columns strip NUL characters, use RFC 4180-compatible quoting and quote escaping, and prefix a leading apostrophe when the text begins with a formula-trigger character. The trigger set is `=`, `+`, `-`, `@`, tab, carriage return, line feed, and the full-width equivalents of `=`, `+`, `-`, and `@` (current OWASP guidance includes these; no mitigation is universally safe across all spreadsheet programs and subsequent save/reopen cycles).
+
+Reversible import rule: exported dangerous text `=SUM(...)` becomes `'=SUM(...)`; an original literal apostrophe-plus-trigger `'=SUM(...)` becomes `''=SUM(...)`; import of `'<trigger>` removes exactly one exporter-added apostrophe and import of `''<trigger>` preserves one literal apostrophe; unwrapping applies only to declared free-text columns; never evaluate a resulting value as a formula.
+
+Required tests: `-1500` numeric; `=1+1`; `+cmd`; `@SUM(A1:A2)`; leading tab; embedded CR/LF; delimiter and quote breakout attempts; an original literal apostrophe; export → import → export stability.
 
 Strip NUL characters.
 
@@ -2954,10 +2996,14 @@ zero and extreme but valid values;
 
 at least six hand-authored golden fixtures with expected intermediate line items; expected values must not be generated by the implementation under test;
 
+trade-equity golden fixtures: zero trade equity; positive trade equity; capitalized negative equity; positive trade equity with the alternate signing-contribution display enabled;
+
 determinism across repeated runs.
 
 19.3 Leasehackr adapter tests
 Use synthetic URLs and golden fixtures.
+
+The three public validation vectors supplied by the architect (SPEC_ERRATA.md Part 3) are manual M3 review artifacts: store them as offline string fixtures for local parse tests, never fetch them in CI, never make them production dependencies, and never copy their deal content into application seed data.
 
 Cover:
 
@@ -3110,7 +3156,7 @@ encoded traversal and malformed percent-encoding return 404;
 
 hashed assets use immutable caching and HTML does not;
 
-gzip is used only for accepted compressible responses;
+gzip is used only for accepted compressible responses; `Vary: Accept-Encoding` is present on every compressible representation (gzip or identity, GET and HEAD alike), an existing `Vary` value is preserved or appended rather than replaced, and a gzip response never carries the uncompressed `Content-Length`;
 
 default responses deny framing;
 
@@ -3197,7 +3243,7 @@ Content-Security-Policy with default-src 'self', no objects, a self-only connect
 
 X-Frame-Options: DENY when framing is denied.
 
-Do not add 'unsafe-eval' to the CSP. Use 'unsafe-inline' for styles only when required by the verified AG Grid/Tailwind build.
+Do not add 'unsafe-eval' to the CSP. `style-src 'unsafe-inline'` is accepted for v0.1 because AG Grid's current theming system injects style elements by default (Tailwind is not the justification); nonce-based hardening via AG Grid's `styleNonce` is out of scope for v0.1. `img-src` must include `data:` because AG Grid's current themes use data URLs for SVG icons. `script-src 'self'` must hold: the Vite production index.html contains no inline executable script, the application loads under `script-src 'self'`, and no dependency requires `unsafe-eval`. Do not use AG Grid string expressions for value getters, class rules, or similar options; use functions only.
 
 21.3 Reserved embed security
 The default deployment is not frameable.
@@ -3825,9 +3871,10 @@ const server = createServer((request, response) => {
   const extension = extname(filePath);
   const stat = statSync(filePath);
   const isHashedAsset = filePath.includes(`${distDir}/assets/`);
+  const isCompressible = compressibleExtensions.has(extension);
   const acceptsGzip =
     method === "GET" &&
-    compressibleExtensions.has(extension) &&
+    isCompressible &&
     request.headers["accept-encoding"]?.includes("gzip");
 
   const headers = {
@@ -3836,8 +3883,9 @@ const server = createServer((request, response) => {
     "Cache-Control": isHashedAsset
       ? "public, max-age=31536000, immutable"
       : "no-cache",
+    ...(isCompressible ? { Vary: "Accept-Encoding" } : {}),
     ...(acceptsGzip
-      ? { "Content-Encoding": "gzip", Vary: "Accept-Encoding" }
+      ? { "Content-Encoding": "gzip" }
       : { "Content-Length": stat.size }),
   };
 
@@ -3884,6 +3932,8 @@ Health timeout	120 seconds
 Replicas	1
 Region	US West when the current API supports explicit selection
 Runtime variables	NODE_ENV=production, VITE_ENABLE_EDMUNDS_PASTE=false, EMBED_ALLOWED_ORIGINS=, VITE_EMBED_ALLOWED_ORIGINS=
+
+Variable scope annotation: `EMBED_ALLOWED_ORIGINS` is a Railway process runtime value read by the Node static server; `VITE_EMBED_ALLOWED_ORIGINS` and `VITE_ENABLE_EDMUNDS_PASTE` are browser bundle build-time values that Vite statically replaces during the production build. Changing a `VITE_*` value requires a new build and deployment — annotate this in `.railway/railway.ts` comments. In v0.1 both embed allowlists stay empty, the Edmunds flag stays false, and runtime-config injection is out of scope.
 Volume	none
 Database/Redis	none
 Cron/worker	none
@@ -4143,6 +4193,21 @@ pnpm --filter @lease-matrix/lease-engine test
 pnpm --filter @lease-matrix/integration-protocol test
 pnpm typecheck
 Commit: feat: add lease domain engine and protocol
+
+Milestone 1a — Calculation semantics gate (human review)
+Run after domain schemas and the forward-calculation skeleton exist, before the inverse solvers and the full golden-fixture set. Purpose: catch sign and rounding mistakes before they spread through the target-DAS and implied-price solvers.
+
+Required evidence:
+
+one simple no-tax/no-fee forward fixture;
+
+one California monthly-tax fixture;
+
+positive-equity and negative-equity hand calculations;
+
+confirmation of component rounding and final monthly rounding;
+
+confirmation that first-payment semantics come from the tax-profile output (`firstPaymentCents`), not a global post-tax assumption.
 
 Milestone 2 — Workspace and grid
 Deliver:
